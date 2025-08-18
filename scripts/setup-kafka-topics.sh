@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Kafka Topics Setup Script
-# This script creates all necessary Kafka topics for the POC
+# Kafka Topics Setup Script for Docker
+# This script creates all necessary Kafka topics for the POC using Docker Compose
 
 set -e  # Exit on any error
 
@@ -19,6 +19,8 @@ PARTITIONS=${PARTITIONS:-3}
 RETENTION_MS=${RETENTION_MS:-604800000}  # 7 days in milliseconds
 CLEANUP_POLICY=${CLEANUP_POLICY:-"delete"}
 MIN_INSYNC_REPLICAS=${MIN_INSYNC_REPLICAS:-1}
+DOCKER_COMPOSE_FILE=${DOCKER_COMPOSE_FILE:-"docker-compose.yml"}
+KAFKA_CONTAINER=${KAFKA_CONTAINER:-"kafka"}
 
 # Topic configurations
 declare -A TOPICS=(
@@ -57,7 +59,7 @@ declare -A TOPIC_CLEANUP=(
 # Functions
 print_header() {
     echo -e "${BLUE}=================================================${NC}"
-    echo -e "${BLUE}          Kafka Topics Setup Script${NC}"
+    echo -e "${BLUE}     Kafka Topics Setup Script (Docker)${NC}"
     echo -e "${BLUE}=================================================${NC}"
     echo ""
 }
@@ -69,37 +71,69 @@ print_config() {
     echo "  Default Partitions: $PARTITIONS"
     echo "  Default Retention: $RETENTION_MS ms"
     echo "  Min In-Sync Replicas: $MIN_INSYNC_REPLICAS"
+    echo "  Docker Compose File: $DOCKER_COMPOSE_FILE"
+    echo "  Kafka Container: $KAFKA_CONTAINER"
+    echo ""
+}
+
+check_docker_compose() {
+    echo -e "${YELLOW}Checking Docker Compose setup...${NC}"
+    
+    if ! command -v docker-compose &> /dev/null; then
+        echo -e "${RED}Error: docker-compose command not found!${NC}"
+        echo "Please install Docker Compose"
+        exit 1
+    fi
+    
+    if [ ! -f "$DOCKER_COMPOSE_FILE" ]; then
+        echo -e "${RED}Error: Docker Compose file '$DOCKER_COMPOSE_FILE' not found!${NC}"
+        echo "Please ensure you're running this script from the project root"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✓ Docker Compose is available${NC}"
     echo ""
 }
 
 check_kafka_availability() {
-    echo -e "${YELLOW}Checking Kafka availability...${NC}"
+    echo -e "${YELLOW}Checking Kafka container and connectivity...${NC}"
     
-    if command -v kafka-topics.sh &> /dev/null; then
-        KAFKA_TOPICS_CMD="kafka-topics.sh"
-    elif command -v kafka-topics &> /dev/null; then
-        KAFKA_TOPICS_CMD="kafka-topics"
-    elif [ -f "/opt/kafka/bin/kafka-topics.sh" ]; then
-        KAFKA_TOPICS_CMD="/opt/kafka/bin/kafka-topics.sh"
-    elif [ -f "/usr/local/bin/kafka-topics" ]; then
-        KAFKA_TOPICS_CMD="/usr/local/bin/kafka-topics"
-    else
-        echo -e "${RED}Error: kafka-topics command not found!${NC}"
-        echo "Please ensure Kafka is installed and in your PATH"
-        echo "Or run this script from the Kafka installation directory"
+    # Check if Kafka container is running
+    if ! docker-compose ps $KAFKA_CONTAINER | grep -q "Up"; then
+        echo -e "${RED}Error: Kafka container is not running!${NC}"
+        echo "Please start the services first:"
+        echo "  docker-compose up -d"
         exit 1
     fi
     
-    # Test connection to Kafka
-    if ! $KAFKA_TOPICS_CMD --bootstrap-server $KAFKA_BROKERS --list &> /dev/null; then
-        echo -e "${RED}Error: Cannot connect to Kafka brokers at $KAFKA_BROKERS${NC}"
-        echo "Please ensure Kafka is running and accessible"
-        exit 1
-    fi
+    # Set the Kafka topics command for Docker
+    KAFKA_TOPICS_CMD="docker-compose exec -T $KAFKA_CONTAINER kafka-topics"
     
-    echo -e "${GREEN}✓ Kafka is available and accessible${NC}"
-    echo "  Using command: $KAFKA_TOPICS_CMD"
-    echo ""
+    # Test connection to Kafka (with retries)
+    local retries=5
+    local wait_time=2
+    
+    echo "Testing Kafka connection (may take a few moments)..."
+    
+    for ((i=1; i<=retries; i++)); do
+        if $KAFKA_TOPICS_CMD --bootstrap-server $KAFKA_BROKERS --list &> /dev/null; then
+            echo -e "${GREEN}✓ Kafka is available and accessible${NC}"
+            echo "  Using command: $KAFKA_TOPICS_CMD"
+            echo ""
+            return 0
+        else
+            if [ $i -eq $retries ]; then
+                echo -e "${RED}Error: Cannot connect to Kafka brokers at $KAFKA_BROKERS${NC}"
+                echo "Please ensure Kafka is fully started and accessible"
+                echo "Check with: docker-compose logs kafka"
+                exit 1
+            else
+                echo "  Attempt $i/$retries failed, retrying in ${wait_time}s..."
+                sleep $wait_time
+                wait_time=$((wait_time * 2))  # Exponential backoff
+            fi
+        fi
+    done
 }
 
 list_existing_topics() {
@@ -130,7 +164,7 @@ create_topic() {
     echo "  Description: $description"
     echo "  Partitions: $partitions"
     echo "  Replication Factor: $REPLICATION_FACTOR"
-    echo "  Retention: $retention ms"
+    echo "  Retention: $retention ms ($(($retention / 86400000)) days)"
     echo "  Cleanup Policy: $cleanup"
     
     if topic_exists "$topic"; then
@@ -161,7 +195,7 @@ create_topic() {
             --config min.compaction.lag.ms=3600000"
     fi
     
-    if eval $create_cmd; then
+    if eval $create_cmd 2>/dev/null; then
         echo -e "${GREEN}  ✓ Topic created successfully${NC}"
     else
         echo -e "${RED}  ✗ Failed to create topic${NC}"
@@ -264,14 +298,20 @@ cleanup_old_topics() {
         "*-temp"
         "*-debug"
         "tmp-*"
+        "__consumer_offsets"
+        "__transaction_state"
     )
     
     local topics_to_delete=()
+    local existing_topics=$($KAFKA_TOPICS_CMD --bootstrap-server $KAFKA_BROKERS --list 2>/dev/null || echo "")
     
     for pattern in "${cleanup_patterns[@]}"; do
-        local matching_topics=$($KAFKA_TOPICS_CMD --bootstrap-server $KAFKA_BROKERS --list 2>/dev/null | grep -E "^${pattern//\*/.*}$" || true)
+        local matching_topics=$(echo "$existing_topics" | grep -E "^${pattern//\*/.*}$" || true)
         if [ ! -z "$matching_topics" ]; then
-            topics_to_delete+=($matching_topics)
+            # Skip internal Kafka topics
+            if [[ "$pattern" != "__consumer_offsets" && "$pattern" != "__transaction_state" ]]; then
+                topics_to_delete+=($matching_topics)
+            fi
         fi
     done
     
@@ -287,6 +327,19 @@ cleanup_old_topics() {
         echo "  No cleanup needed"
     fi
     echo ""
+}
+
+show_topic_details() {
+    echo -e "${YELLOW}Topic Details:${NC}"
+    echo ""
+    
+    for topic in "${!TOPICS[@]}"; do
+        if topic_exists "$topic"; then
+            echo -e "${GREEN}Topic: $topic${NC}"
+            $KAFKA_TOPICS_CMD --bootstrap-server $KAFKA_BROKERS --describe --topic $topic 2>/dev/null | sed 's/^/  /'
+            echo ""
+        fi
+    done
 }
 
 print_final_summary() {
@@ -312,10 +365,13 @@ print_final_summary() {
     echo "     npm run start:producer"
     echo ""
     echo "  3. Monitor topics:"
-    echo "     $KAFKA_TOPICS_CMD --bootstrap-server $KAFKA_BROKERS --list"
+    echo "     docker-compose exec $KAFKA_CONTAINER kafka-topics --bootstrap-server $KAFKA_BROKERS --list"
     echo ""
     echo "  4. Check consumer groups:"
-    echo "     kafka-consumer-groups.sh --bootstrap-server $KAFKA_BROKERS --list"
+    echo "     docker-compose exec $KAFKA_CONTAINER kafka-consumer-groups --bootstrap-server $KAFKA_BROKERS --list"
+    echo ""
+    echo "  5. View Kafka UI: http://localhost:8090 (if running)"
+    echo "  6. View Mongo Express: http://localhost:8081"
     echo ""
     
     echo -e "${BLUE}=================================================${NC}"
@@ -324,16 +380,19 @@ print_final_summary() {
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Setup Kafka topics for the Kafka-MongoDB POC"
+    echo "Setup Kafka topics for the Kafka-MongoDB POC using Docker Compose"
     echo ""
     echo "Options:"
     echo "  -b, --brokers BROKERS     Kafka bootstrap servers (default: localhost:9092)"
     echo "  -r, --replication FACTOR  Replication factor (default: 1)"
     echo "  -p, --partitions COUNT    Default partition count (default: 3)"
     echo "  -t, --retention MS        Default retention in milliseconds (default: 604800000)"
+    echo "  -f, --file FILE           Docker Compose file (default: docker-compose.yml)"
+    echo "  -c, --container NAME      Kafka container name (default: kafka)"
     echo "  --cleanup                 Show cleanup commands for old topics"
     echo "  --verify-only             Only verify existing topics, don't create new ones"
     echo "  --list-only               Only list existing topics"
+    echo "  --details                 Show detailed topic information"
     echo "  -h, --help                Show this help"
     echo ""
     echo "Environment variables:"
@@ -341,12 +400,16 @@ show_help() {
     echo "  REPLICATION_FACTOR       Topic replication factor"
     echo "  PARTITIONS               Default partition count"
     echo "  RETENTION_MS             Default retention in milliseconds"
+    echo "  DOCKER_COMPOSE_FILE      Docker Compose file path"
+    echo "  KAFKA_CONTAINER          Kafka container name"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Use defaults"
     echo "  $0 -b kafka1:9092,kafka2:9092        # Multiple brokers"
     echo "  $0 -r 3 -p 6                         # 3 replicas, 6 partitions"
     echo "  $0 --verify-only                     # Just verify existing topics"
+    echo "  $0 --details                         # Show topic details"
+    echo "  $0 -f docker-compose.prod.yml        # Use different compose file"
     echo ""
 }
 
@@ -369,22 +432,40 @@ while [[ $# -gt 0 ]]; do
             RETENTION_MS="$2"
             shift 2
             ;;
+        -f|--file)
+            DOCKER_COMPOSE_FILE="$2"
+            shift 2
+            ;;
+        -c|--container)
+            KAFKA_CONTAINER="$2"
+            shift 2
+            ;;
         --cleanup)
             print_header
+            check_docker_compose
             check_kafka_availability
             cleanup_old_topics
             exit 0
             ;;
         --verify-only)
             print_header
+            check_docker_compose
             check_kafka_availability
             verify_all_topics
             exit 0
             ;;
         --list-only)
             print_header
+            check_docker_compose
             check_kafka_availability
             list_existing_topics
+            exit 0
+            ;;
+        --details)
+            print_header
+            check_docker_compose
+            check_kafka_availability
+            show_topic_details
             exit 0
             ;;
         -h|--help)
@@ -403,6 +484,7 @@ done
 main() {
     print_header
     print_config
+    check_docker_compose
     check_kafka_availability
     list_existing_topics
     create_all_topics
